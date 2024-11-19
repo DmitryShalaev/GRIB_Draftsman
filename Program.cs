@@ -56,54 +56,6 @@ class Program {
         DrawAllMaps(filePath);
     }
 
-    static void DrawLayerWithBackground(Band band, SKBitmap backgroundBitmap, string outputDirectory, int layerIndex) {
-        int width = band.XSize;
-        int height = band.YSize;
-
-        float[] data = new float[width * height];
-        band.ReadRaster(0, 0, width, height, data, width, height, 0, 0);
-
-        int imageWidth = backgroundBitmap.Width;
-        int imageHeight = backgroundBitmap.Height;
-
-        using var bitmap = new SKBitmap(imageWidth, imageHeight);
-        using var canvas = new SKCanvas(bitmap);
-
-        // Рисуем фон
-        canvas.DrawBitmap(backgroundBitmap, 0, 0);
-
-        // Нормализация данных
-        float minValue = data.Min();
-        float maxValue = data.Max();
-        float valueRange = maxValue - minValue;
-        float normalizationFactor = 1f / valueRange;
-
-        var paint = new SKPaint {
-            IsAntialias = true,
-            Style = SKPaintStyle.Stroke,
-            StrokeWidth = 1.5f,
-            Color = SKColors.Black
-        };
-
-        // Отрисовка контуров
-        int contourLevels = 10;
-        float interval = valueRange / contourLevels;
-
-        for(int level = 1; level < contourLevels; level++) {
-            float contourValue = minValue + level * interval;
-            DrawContours(canvas, paint, data, width, height, imageWidth, imageHeight, contourValue);
-        }
-
-        // Сохранение карты
-        string outputPath = Path.Combine(outputDirectory, $"layer_{layerIndex}_contours.png");
-        using var image = SKImage.FromBitmap(bitmap);
-        using SKData dataImage = image.Encode(SKEncodedImageFormat.Png, 100);
-        using FileStream stream = File.OpenWrite(outputPath);
-        dataImage.SaveTo(stream);
-
-        Console.WriteLine($"Слой {layerIndex} сохранен в {outputPath}");
-    }
-
     static void DrawAllMaps(string filePath) {
         // Открытие файла GRIB
         using Dataset dataset = Gdal.Open(filePath, Access.GA_ReadOnly);
