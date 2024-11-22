@@ -55,13 +55,12 @@ class Program {
     // Шаблон URL тайлов карты (замените на подходящий тайловый сервер)
     private static readonly string tileUrlTemplate = "https://tile.openstreetmap.org/{0}/{1}/{2}.png";
 
-
     static void Main() {
         // Инициализация GDAL
         Gdal.AllRegister();
 
         // Путь к вашему GRIB файлу
-        string filePath = "GRIBNOA00.000.1";
+        string filePath = "GRIBSOA00.000.1";
 
         DrawAllMaps(filePath);
     }
@@ -265,7 +264,7 @@ class Program {
         }
 
         // Сохранение изображения для текущего слоя
-        string outputPath = Path.Combine(outputDirectory, $"map_layer_{layerIndex}.png");
+        string outputPath = Path.Combine(outputDirectory, $"{band.GetMetadataItem("GRIB_ELEMENT", "")}-{band.GetDescription()}.png");
         using var image = SKImage.FromBitmap(bitmap);
         using SKData dataImage = image.Encode(SKEncodedImageFormat.Png, 100);
         using FileStream stream = File.OpenWrite(outputPath);
@@ -306,14 +305,12 @@ class Program {
         using(var tileCanvas = new SKCanvas(backgroundBitmap)) {
             for(int x = xTileMin; x <= xTileMax; x++) {
                 for(int y = yTileMin; y <= yTileMax; y++) {
-                    SKBitmap tileBitmap = GetTile(zoom, x, y);
+                    SKBitmap? tileBitmap = GetTile(zoom, x, y) ?? throw new ArgumentException("ArgumentException - CreateBackgroundMap");
 
-                    if(tileBitmap != null) {
-                        int offsetX = (x - xTileMin) * tileWidth;
-                        int offsetY = (y - yTileMin) * tileHeight;
+                    int offsetX = (x - xTileMin) * tileWidth;
+                    int offsetY = (y - yTileMin) * tileHeight;
 
-                        tileCanvas.DrawBitmap(tileBitmap, offsetX, offsetY);
-                    }
+                    tileCanvas.DrawBitmap(tileBitmap, offsetX, offsetY);
                 }
             }
         }
@@ -322,7 +319,7 @@ class Program {
     }
 
     // Функция для получения тайла карты
-    static SKBitmap GetTile(int zoom, int xTile, int yTile) {
+    static SKBitmap? GetTile(int zoom, int xTile, int yTile) {
         string tilePath = Path.Combine(tileCacheDirectory, zoom.ToString(), xTile.ToString(), yTile.ToString() + ".png");
 
         if(File.Exists(tilePath)) {
@@ -339,7 +336,10 @@ class Program {
                 byte[] data = client.GetByteArrayAsync(url).Result;
 
                 // Сохранение тайла в кэш
-                string tileDir = Path.GetDirectoryName(tilePath);
+                string? tileDir = Path.GetDirectoryName(tilePath);
+                if(string.IsNullOrEmpty(tileDir))
+                    return null;
+
                 Directory.CreateDirectory(tileDir);
                 File.WriteAllBytes(tilePath, data);
 
@@ -371,9 +371,7 @@ class Program {
         return tileY;
     }
 
-    static double TileXToLon(int xTile, int zoom) {
-        return xTile / Math.Pow(2.0, zoom) * 360.0 - 180;
-    }
+    static double TileXToLon(int xTile, int zoom) => xTile / Math.Pow(2.0, zoom) * 360.0 - 180;
 
     static double TileYToLat(int yTile, int zoom) {
         double n = Math.PI - 2.0 * Math.PI * yTile / Math.Pow(2.0, zoom);
