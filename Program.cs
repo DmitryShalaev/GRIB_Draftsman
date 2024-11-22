@@ -1,11 +1,12 @@
 ﻿using OSGeo.GDAL;
+using OSGeo.OSR;
 
 using SkiaSharp;
 
 class Program {
     // Настройки изображения
-    private static readonly int imageWidth = 4096; // Ширина изображения
-    private static readonly int imageHeight = 3072; // Высота изображения
+    private static readonly int imageWidth = 2048; // Ширина изображения
+    private static readonly int imageHeight = 1080; // Высота изображения
 
     // Количество уровней контуров для большей детализации
     private static readonly int contourLevels = 15;
@@ -34,6 +35,10 @@ class Program {
     // Количество цветов в палитре
     private static readonly int colorPaletteSize = 256;
 
+    // Уровень прозрачности (0 - полностью прозрачный, 255 - полностью непрозрачный)
+    private static readonly byte desiredAlpha = 64; // 128 для 50% прозрачности
+    private static readonly byte contourAlpha = 128; // 128 для 50% прозрачности
+
     // Параметры для динамической толщины линии
     private static readonly float baseResolution = 1920f; // Базовая ширина разрешения
     private static readonly float baseStrokeWidth = 1.5f; // Базовая толщина линии при базовом разрешении
@@ -41,18 +46,23 @@ class Program {
     // Малое число для избежания деления на ноль
     private static readonly float epsilon = 1e-7f;
 
-    // Путь к файлу GRIB
-    private static readonly string filePath = "GRIBNOA00.000.1";
-
     // Выходной каталог для сохранения карт
     private static readonly string outputDirectory = "output_maps";
 
-    static void Main(string[] args) {
+    // Каталог для кэша тайлов карты
+    private static readonly string tileCacheDirectory = "tile_cache";
+
+    // Шаблон URL тайлов карты (замените на подходящий тайловый сервер)
+    private static readonly string tileUrlTemplate = "https://tile.openstreetmap.org/{0}/{1}/{2}.png";
+
+
+    static void Main() {
         // Инициализация GDAL
         Gdal.AllRegister();
 
         // Путь к вашему GRIB файлу
         string filePath = "GRIBNOA00.000.1";
+
         DrawAllMaps(filePath);
     }
 
@@ -73,13 +83,13 @@ class Program {
         // Последовательная обработка каждого слоя
         for(int i = 1; i <= layerCount; i++) {
             using Band band = dataset.GetRasterBand(i);
-            DrawLayerWithSmoothContours(band, outputDirectory, i);
+            DrawLayerWithSmoothContours(dataset, band, outputDirectory, i);
         }
 
         Console.WriteLine($"Все карты успешно сохранены в {outputDirectory}");
     }
 
-    static void DrawLayerWithSmoothContours(Band band, string outputDirectory, int layerIndex) {
+    static void DrawLayerWithSmoothContours(Dataset dataset, Band band, string outputDirectory, int layerIndex) {
         int width = band.XSize;
         int height = band.YSize;
 
@@ -87,9 +97,74 @@ class Program {
         float[] data = new float[width * height];
         band.ReadRaster(0, 0, width, height, data, width, height, 0, 0);
 
-        // Предварительный расчет констант
-        float imageToDataScaleX = (width - 1) / (float)(imageWidth - 1);
-        float imageToDataScaleY = (height - 1) / (float)(imageHeight - 1);
+        // Получение геотрансформации и преобразования координат
+        double[] geoTransform = new double[6];
+        dataset.GetGeoTransform(geoTransform);
+
+        var srcSpatialRef = new SpatialReference(dataset.GetProjectionRef());
+        var dstSpatialRef = new SpatialReference("");
+        dstSpatialRef.ImportFromEPSG(4326); // WGS84
+        var coordTransform = new CoordinateTransformation(srcSpatialRef, dstSpatialRef);
+
+        // Вычисление географических координат углов
+        (double corner1Lon, double corner1Lat) = PixelToLatLon(0, 0, geoTransform, coordTransform);
+        (double corner2Lon, double corner2Lat) = PixelToLatLon(width - 1, 0, geoTransform, coordTransform);
+        (double corner3Lon, double corner3Lat) = PixelToLatLon(width - 1, height - 1, geoTransform, coordTransform);
+        (double corner4Lon, double corner4Lat) = PixelToLatLon(0, height - 1, geoTransform, coordTransform);
+
+        // Вычисление минимальных и максимальных долготы и широты
+        double minLon = Math.Min(Math.Min(corner1Lon, corner2Lon), Math.Min(corner3Lon, corner4Lon));
+        double maxLon = Math.Max(Math.Max(corner1Lon, corner2Lon), Math.Max(corner3Lon, corner4Lon));
+
+        double minLat = Math.Min(Math.Min(corner1Lat, corner2Lat), Math.Min(corner3Lat, corner4Lat));
+        double maxLat = Math.Max(Math.Max(corner1Lat, corner2Lat), Math.Max(corner3Lat, corner4Lat));
+
+        // Ограничение значений долготы и широты
+        minLon = Math.Max(-180.0, Math.Min(179.999999, minLon));
+        maxLon = Math.Max(-180.0, Math.Min(179.999999, maxLon));
+        minLat = Math.Max(-85.05112878, Math.Min(85.05112878, minLat));
+        maxLat = Math.Max(-85.05112878, Math.Min(85.05112878, maxLat));
+
+        // Выбор уровня зума для тайлов карты
+        int zoom = CalculateZoomLevel(minLon, maxLon, imageWidth);
+
+        // Вычисление индексов тайлов
+        int xTileMin = LonToTileX(minLon, zoom);
+        int xTileMax = LonToTileX(maxLon, zoom);
+        int yTileMin = LatToTileY(maxLat, zoom);
+        int yTileMax = LatToTileY(minLat, zoom);
+
+        int maxTileIndex = (1 << zoom) - 1;
+        xTileMin = Math.Clamp(xTileMin, 0, maxTileIndex);
+        xTileMax = Math.Clamp(xTileMax, 0, maxTileIndex);
+        yTileMin = Math.Clamp(yTileMin, 0, maxTileIndex);
+        yTileMax = Math.Clamp(yTileMax, 0, maxTileIndex);
+
+        if(xTileMin > xTileMax) {
+            (xTileMax, xTileMin) = (xTileMin, xTileMax);
+        }
+
+        if(yTileMin > yTileMax) {
+            (yTileMax, yTileMin) = (yTileMin, yTileMax);
+        }
+
+        // Создание фонового изображения карты
+        SKBitmap backgroundBitmap = CreateBackgroundMap(zoom, xTileMin, xTileMax, yTileMin, yTileMax);
+
+        // Вычисление географических границ фонового изображения
+        double backgroundMinLon = TileXToLon(xTileMin, zoom);
+        double backgroundMaxLon = TileXToLon(xTileMax + 1, zoom);
+        double backgroundMaxLat = TileYToLat(yTileMin, zoom);
+        double backgroundMinLat = TileYToLat(yTileMax + 1, zoom);
+
+        // Вычисление координат для отображения фоновой карты
+        double x0 = (minLon - backgroundMinLon) / (backgroundMaxLon - backgroundMinLon) * backgroundBitmap.Width;
+        double x1 = (maxLon - backgroundMinLon) / (backgroundMaxLon - backgroundMinLon) * backgroundBitmap.Width;
+        double y0 = (backgroundMaxLat - maxLat) / (backgroundMaxLat - backgroundMinLat) * backgroundBitmap.Height;
+        double y1 = (backgroundMaxLat - minLat) / (backgroundMaxLat - backgroundMinLat) * backgroundBitmap.Height;
+
+        var sourceRect = new SKRect((float)x0, (float)y0, (float)x1, (float)y1);
+        var destRect = new SKRect(0, 0, imageWidth, imageHeight);
 
         // Нормализация данных для отображения
         float minValue = data.Min();
@@ -107,14 +182,24 @@ class Program {
         }
 
         using var bitmap = new SKBitmap(imageWidth, imageHeight);
+        using var canvas = new SKCanvas(bitmap);
 
-        // Прямой доступ к буферу пикселей
-        IntPtr pixelsAddr = bitmap.GetPixels();
-        int bytesPerPixel = bitmap.BytesPerPixel;
-        int rowBytes = bitmap.RowBytes;
-        byte[] pixelBuffer = new byte[bitmap.ByteCount];
+        // Отрисовка фоновой карты
+        canvas.DrawBitmap(backgroundBitmap, sourceRect, destRect);
 
         // Билинейная интерполяция для каждого пикселя (параллельно)
+        float imageToDataScaleX = (width - 1) / (float)(imageWidth - 1);
+        float imageToDataScaleY = (height - 1) / (float)(imageHeight - 1);
+
+        // Создаем массив пикселей для наложения данных
+        var dataBitmap = new SKBitmap(imageWidth, imageHeight, SKColorType.Rgba8888, SKAlphaType.Premul);
+        IntPtr pixelsAddr = dataBitmap.GetPixels();
+        int bytesPerPixel = dataBitmap.BytesPerPixel;
+        int rowBytes = dataBitmap.RowBytes;
+        byte[] pixelBuffer = new byte[dataBitmap.ByteCount];
+
+        float alphaFactor = desiredAlpha / 255f;
+
         Parallel.For(0, imageHeight, y => {
             float originalY = y * imageToDataScaleY;
             int y0 = (int)originalY;
@@ -125,6 +210,7 @@ class Program {
                 float originalX = x * imageToDataScaleX;
                 int x0 = (int)originalX;
                 int x1 = Math.Min(x0 + 1, width - 1);
+
                 float fx = originalX - x0;
 
                 float v00 = data[y0 * width + x0];
@@ -149,17 +235,17 @@ class Program {
                 int pixelIndex = y * rowBytes + x * bytesPerPixel;
 
                 // Запись цвета в буфер пикселей
-                pixelBuffer[pixelIndex + 0] = color.Blue;
-                pixelBuffer[pixelIndex + 1] = color.Green;
-                pixelBuffer[pixelIndex + 2] = color.Red;
-                pixelBuffer[pixelIndex + 3] = color.Alpha;
+                pixelBuffer[pixelIndex + 0] = (byte)(color.Blue * alphaFactor);
+                pixelBuffer[pixelIndex + 1] = (byte)(color.Green * alphaFactor);
+                pixelBuffer[pixelIndex + 2] = (byte)(color.Red * alphaFactor);
+                pixelBuffer[pixelIndex + 3] = desiredAlpha;
             }
         });
 
         // Копирование буфера пикселей в bitmap
         System.Runtime.InteropServices.Marshal.Copy(pixelBuffer, 0, pixelsAddr, pixelBuffer.Length);
 
-        using var canvas = new SKCanvas(bitmap);
+        canvas.DrawBitmap(dataBitmap, new SKPoint(0, 0));
 
         // Параметры для контурных линий с динамической толщиной
         float scalingFactor = imageWidth / baseResolution;
@@ -169,7 +255,7 @@ class Program {
             IsAntialias = true,
             Style = SKPaintStyle.Stroke,
             StrokeWidth = strokeWidth,
-            Color = SKColors.Black.WithAlpha(128)
+            Color = SKColors.Black.WithAlpha(contourAlpha)
         };
 
         // Отрисовка контурных линий
@@ -186,6 +272,122 @@ class Program {
         dataImage.SaveTo(stream);
 
         Console.WriteLine($"Карта для слоя {layerIndex} сохранена в {outputPath}");
+    }
+
+    // Функция для вычисления уровня зума
+    static int CalculateZoomLevel(double minLon, double maxLon, int imageWidth) {
+        for(int z = 18; z >= 0; z--) {
+            double worldPixelWidth = 256 * Math.Pow(2, z);
+            double lonPerPixel = 360.0 / worldPixelWidth;
+            double pixelWidth = (maxLon - minLon) / lonPerPixel;
+            if(pixelWidth <= imageWidth) {
+                return z;
+            }
+        }
+
+        return 0;
+    }
+
+    // Функция для создания фоновой карты
+    static SKBitmap CreateBackgroundMap(int zoom, int xTileMin, int xTileMax, int yTileMin, int yTileMax) {
+        int tileWidth = 256;
+        int tileHeight = 256;
+
+        int numTilesX = xTileMax - xTileMin + 1;
+        int numTilesY = yTileMax - yTileMin + 1;
+
+        int backgroundWidth = numTilesX * tileWidth;
+        int backgroundHeight = numTilesY * tileHeight;
+
+        var backgroundBitmap = new SKBitmap(backgroundWidth, backgroundHeight);
+
+        Directory.CreateDirectory(tileCacheDirectory);
+
+        using(var tileCanvas = new SKCanvas(backgroundBitmap)) {
+            for(int x = xTileMin; x <= xTileMax; x++) {
+                for(int y = yTileMin; y <= yTileMax; y++) {
+                    SKBitmap tileBitmap = GetTile(zoom, x, y);
+
+                    if(tileBitmap != null) {
+                        int offsetX = (x - xTileMin) * tileWidth;
+                        int offsetY = (y - yTileMin) * tileHeight;
+
+                        tileCanvas.DrawBitmap(tileBitmap, offsetX, offsetY);
+                    }
+                }
+            }
+        }
+
+        return backgroundBitmap;
+    }
+
+    // Функция для получения тайла карты
+    static SKBitmap GetTile(int zoom, int xTile, int yTile) {
+        string tilePath = Path.Combine(tileCacheDirectory, zoom.ToString(), xTile.ToString(), yTile.ToString() + ".png");
+
+        if(File.Exists(tilePath)) {
+            // Загрузка тайла из кэша
+            using FileStream stream = File.OpenRead(tilePath);
+            return SKBitmap.Decode(stream);
+        } else {
+            // Скачивание тайла
+            string url = string.Format(tileUrlTemplate, zoom, xTile, yTile);
+
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Add("User-Agent", "GRIBToMap/1.0");
+            try {
+                byte[] data = client.GetByteArrayAsync(url).Result;
+
+                // Сохранение тайла в кэш
+                string tileDir = Path.GetDirectoryName(tilePath);
+                Directory.CreateDirectory(tileDir);
+                File.WriteAllBytes(tilePath, data);
+
+                // Загрузка тайла
+                using var ms = new MemoryStream(data);
+                return SKBitmap.Decode(ms);
+            } catch {
+                // Не удалось скачать тайл
+                return null;
+            }
+        }
+    }
+
+    // Функции для преобразования координат тайлов и географических координат
+    static int LonToTileX(double lon, int zoom) {
+        lon = ((lon + 180.0) % 360.0 + 360.0) % 360.0 - 180.0; // Нормализация долготы [-180, 180)
+        double n = (lon + 180.0) / 360.0;
+        int tileX = (int)Math.Floor(n * (1 << zoom));
+        tileX = Math.Clamp(tileX, 0, (1 << zoom) - 1);
+        return tileX;
+    }
+
+    static int LatToTileY(double lat, int zoom) {
+        lat = Math.Max(-85.05112878, Math.Min(85.05112878, lat)); // Ограничение широты
+        double latRad = lat * Math.PI / 180.0;
+        double n = (1.0 - Math.Log(Math.Tan(latRad) + 1.0 / Math.Cos(latRad)) / Math.PI) / 2.0;
+        int tileY = (int)Math.Floor(n * (1 << zoom));
+        tileY = Math.Clamp(tileY, 0, (1 << zoom) - 1);
+        return tileY;
+    }
+
+    static double TileXToLon(int xTile, int zoom) {
+        return xTile / Math.Pow(2.0, zoom) * 360.0 - 180;
+    }
+
+    static double TileYToLat(int yTile, int zoom) {
+        double n = Math.PI - 2.0 * Math.PI * yTile / Math.Pow(2.0, zoom);
+        return 180.0 / Math.PI * Math.Atan(0.5 * (Math.Exp(n) - Math.Exp(-n)));
+    }
+
+    static (double lon, double lat) PixelToLatLon(double xPixel, double yPixel, double[] geoTransform, CoordinateTransformation coordTransform) {
+        double xGeo = geoTransform[0] + xPixel * geoTransform[1] + yPixel * geoTransform[2];
+        double yGeo = geoTransform[3] + xPixel * geoTransform[4] + yPixel * geoTransform[5];
+
+        double[] transformed = new double[3];
+        coordTransform.TransformPoint(transformed, xGeo, yGeo, 0);
+
+        return (transformed[0], transformed[1]);
     }
 
     static void DrawContours(SKCanvas canvas, SKPaint contourPaint, float[] data, int width, int height, int imageWidth, int imageHeight, float contourValue) {
