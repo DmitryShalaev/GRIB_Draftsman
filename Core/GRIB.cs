@@ -59,6 +59,12 @@ namespace Core {
             Gdal.AllRegister();
         }
 
+        public static bool IsGRIB(string filePath) {
+            using Dataset dataset = Gdal.Open(filePath, Access.GA_ReadOnly);
+
+            return dataset != null;
+        }
+
         public void DrawAllMaps(string filePath) {
             // Открытие файла GRIB
             using Dataset dataset = Gdal.Open(filePath, Access.GA_ReadOnly);
