@@ -11,6 +11,7 @@
     <PackageReference Include="ProjNet" Version="2.0.0" />
     <PackageReference Include="SkiaSharp" Version="2.88.9" />
     <PackageReference Include="ThinkGeo.Gdal" Version="14.2.1" />
+    <PackageReference Include="ThinkGeo.Gdal.Dependency.Linux" Version="14.0.0" />
   </ItemGroup>
 
 	<ItemGroup>
