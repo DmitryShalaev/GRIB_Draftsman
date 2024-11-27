@@ -6,6 +6,12 @@ using SkiaSharp;
 namespace Core {
 
     public class GRIB {
+        // Определяем делегат для события
+        public delegate void MapSavedEventHandler(string outputPath);
+
+        // Определяем событие
+        public event MapSavedEventHandler? MapSaved;
+
         // Таблица линий для каждой из 16 возможных конфигураций
         private static readonly int[,] lineTable = new int[16, 4]
         {
@@ -59,10 +65,32 @@ namespace Core {
             Gdal.AllRegister();
         }
 
-        public static bool IsGRIB(string filePath) {
-            using Dataset dataset = Gdal.Open(filePath, Access.GA_ReadOnly);
+        public static List<string>? CheckGRIB(byte[] fileBytes) {
+            Gdal.AllRegister();
 
-            return dataset != null;
+            try {
+                string tempFilePath = Path.GetTempFileName();
+                File.WriteAllBytes(tempFilePath, fileBytes);
+
+                using(Dataset dataset = Gdal.Open(tempFilePath, Access.GA_ReadOnly)) {
+                    if(dataset != null) {
+                        string driverName = dataset.GetDriver().ShortName;
+                        if(driverName == "GRIB") {
+                            List<string> strings = [];
+                            for(int i = 1; i <= dataset.RasterCount; i++) {
+                                using Band band = dataset.GetRasterBand(i);
+                                strings.Add($"{band.GetMetadataItem("GRIB_ELEMENT", "")}-{band.GetDescription()}");
+                            }
+
+                            return strings;
+                        }
+                    }
+
+                    return null;
+                }
+            } catch(Exception) {
+                return null;
+            }
         }
 
         public void DrawAllMaps(string filePath) {
@@ -257,12 +285,15 @@ namespace Core {
 
         private void SaveLayerImage(SKBitmap bitmap, Band band, int layerIndex) {
             string outputPath = Path.Combine(outputDirectory, $"{band.GetMetadataItem("GRIB_ELEMENT", "")}-{band.GetDescription()}.png");
-            using var image = SKImage.FromBitmap(bitmap);
-            using SKData dataImage = image.Encode(SKEncodedImageFormat.Png, 100);
-            using FileStream stream = File.OpenWrite(outputPath);
-            dataImage.SaveTo(stream);
+            using(var image = SKImage.FromBitmap(bitmap)) {
+                using SKData dataImage = image.Encode(SKEncodedImageFormat.Png, 100);
+                using FileStream stream = File.OpenWrite(outputPath);
+                dataImage.SaveTo(stream);
+            }
 
             Console.WriteLine($"Карта для слоя {layerIndex} сохранена в {outputPath}");
+
+            MapSaved?.Invoke(outputPath);
         }
 
         private void DrawLayerWithSmoothContours(Dataset dataset, Band band, int layerIndex) {
